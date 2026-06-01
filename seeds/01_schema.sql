@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS video_cache (
 
 -- Songs
 CREATE TABLE IF NOT EXISTS songs (
-    song_id           TEXT PRIMARY KEY,
+    song_id      TEXT PRIMARY KEY,
     title        TEXT,
     artist       TEXT,
     album        TEXT,
@@ -36,14 +36,14 @@ CREATE TABLE IF NOT EXISTS playlists (
 -- Playlist <-> Songs junction
 CREATE TABLE IF NOT EXISTS playlist_songs (
     playlist_id INTEGER NOT NULL,
-    song_id     TEXT NOT NULL,   -- fixed: was INTEGER, songs.id is TEXT
+    song_id     TEXT NOT NULL, 
     song_title  TEXT NOT NULL,
     position    INTEGER NOT NULL,
     added_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (playlist_id, song_id),
     FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
-    FOREIGN KEY (song_id)     REFERENCES songs(id)     ON DELETE CASCADE
+    FOREIGN KEY (song_id)     REFERENCES songs(song_id)     ON DELETE CASCADE
 );
 
 -- Recently Played
@@ -56,14 +56,14 @@ CREATE TABLE IF NOT EXISTS recently_played (
 
 -- Liked Songs
 CREATE TABLE IF NOT EXISTS liked_songs (
-    song_id           TEXT PRIMARY KEY,
+    song_id      TEXT PRIMARY KEY,
     title        TEXT,
     artist       TEXT,
     album        TEXT,
     thumbnail    TEXT,
     duration_sec INTEGER,
     liked_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (id) REFERENCES songs(id) ON DELETE CASCADE
+    FOREIGN KEY (song_id) REFERENCES songs(song_id) ON DELETE CASCADE
 );
 
 -- Indexes

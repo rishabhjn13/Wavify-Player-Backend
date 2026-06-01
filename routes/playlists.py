@@ -159,7 +159,7 @@ def get_all_playlists():
 
 
 @router.get("/recently-played")
-def get_recently_played(limit: int):
+def get_recently_played(limit: int = 5):
     if limit < 1 or limit > MAX_PLAYLIST_FETCH_LIMIT:
         raise HTTPException(status_code=400, detail=f"Limit must be between 1 and {MAX_PLAYLIST_FETCH_LIMIT}")
     with get_db_ctx() as db:
@@ -211,9 +211,9 @@ def add_song_to_playlist(playlist_id: int, song: SongAdd):
             # Upsert song into songs table
             db.execute(
                 """
-                INSERT INTO songs (id, title, artist, album, thumbnail, duration_sec, search_string, created_at)
+                INSERT INTO songs (song_id, title, artist, album, thumbnail, duration_sec, search_string, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
+                ON CONFLICT(song_id) DO UPDATE SET
                     title = excluded.title,
                     artist = excluded.artist,
                     album = excluded.album,

@@ -12,7 +12,7 @@ router = APIRouter(tags=["songs"])
 def get_recently_added_songs():
     with get_db_ctx() as db:
         rows = db.execute("""
-            SELECT id, title, artist, album, thumbnail, duration_sec
+            SELECT song_id, title, artist, album, thumbnail, duration_sec
             FROM songs
             ORDER BY created_at DESC
             LIMIT 5
@@ -24,7 +24,7 @@ def get_recently_added_songs():
 def get_liked_songs():
     with get_db_ctx() as db:
         rows = db.execute("""
-            SELECT id, title, artist, album, thumbnail, duration_sec, liked_at
+            SELECT song_id, title, artist, album, thumbnail, duration_sec, liked_at
             FROM liked_songs
             ORDER BY liked_at DESC
         """).fetchall()
@@ -33,21 +33,21 @@ def get_liked_songs():
 
 @router.post("/liked-songs")
 def like_song(song: LikedSong):
-    logger.info("Liking song: '%s' (%s)", song.title, song.id)
+    logger.info("Liking song: '%s' (%s)", song.title, song.song_id)
     try:
         with get_db_ctx() as db:
             db.execute(
                 """
-                INSERT OR IGNORE INTO liked_songs (id, title, artist, album, thumbnail, duration_sec)
+                INSERT OR IGNORE INTO liked_songs (song_id, title, artist, album, thumbnail, duration_sec)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (song.id, song.title, song.artist, song.album, song.thumbnail, song.duration_sec),
+                (song.song_id, song.title, song.artist, song.album, song.thumbnail, song.duration_sec),
             )
-        return {"message": f"'{song.title}' added to liked songs", "id": song.id}
+        return {"message": f"'{song.title}' added to liked songs", "id": song.song_id}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Failed to like song '%s': %s", song.id, e, exc_info=True)
+        logger.error("Failed to like song '%s': %s", song.song_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to save liked song.")
 
 
@@ -57,13 +57,13 @@ def unlike_song(song_id: str):
     try:
         with get_db_ctx() as db:
             row = db.execute(
-                "SELECT id FROM liked_songs WHERE id = ?", (song_id,)
+                "SELECT song_id FROM liked_songs WHERE song_id = ?", (song_id,)
             ).fetchone()
 
             if not row:
                 raise HTTPException(status_code=404, detail="Song not found in liked songs")
 
-            db.execute("DELETE FROM liked_songs WHERE id = ?", (song_id,))
+            db.execute("DELETE FROM liked_songs WHERE song_id = ?", (song_id,))
 
         logger.info("Song unliked: %s", song_id)
         return {"message": "Song removed from liked songs", "id": song_id}

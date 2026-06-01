@@ -213,7 +213,7 @@ def get_last_played():
     with get_db_ctx() as db:
         row = db.execute(
             """
-            SELECT id, title, artist, album, thumbnail, duration_sec
+            SELECT song_id, title, artist, album, thumbnail, duration_sec
             FROM songs
             ORDER BY created_at DESC
             LIMIT 1
