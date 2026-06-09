@@ -152,7 +152,10 @@ class PlaylistResponse(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-
+class PlaylistUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
 # ---------------------------------------------------------------------------
 # Playlist Songs
 # ---------------------------------------------------------------------------

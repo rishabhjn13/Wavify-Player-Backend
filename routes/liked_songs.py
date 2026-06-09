@@ -1,0 +1,49 @@
+from fastapi import APIRouter, HTTPException
+
+from database import get_db_ctx
+from models import LikedSong, SongAdd
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+router = APIRouter(tags=["liked-songs"])
+
+@router.post("/liked-songs")
+def like_song(song: LikedSong):
+    logger.info("Liking song: '%s' (%s)", song.title, song.song_id)
+    try:
+        with get_db_ctx() as db:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO liked_songs (song_id, title, artist, album, thumbnail, duration_sec)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (song.song_id, song.title, song.artist, song.album, song.thumbnail, song.duration_sec),
+            )
+            return {"message": f"'{song.title}' added to liked songs", "id": song.song_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to like song '%s': %s", song.song_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to save liked song.")
+
+@router.delete("/liked-songs/{song_id}")
+def unlike_song(song_id: str):
+    logger.info("Unliking song: %s", song_id)
+    try:
+        with get_db_ctx() as db:
+            row = db.execute(
+                "SELECT song_id FROM liked_songs WHERE song_id = ?", (song_id,)
+            ).fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Song not found in liked songs")
+
+            db.execute("DELETE FROM liked_songs WHERE song_id = ?", (song_id,))
+
+            logger.info("Song unliked: %s", song_id)
+            return {"message": "Song removed from liked songs", "id": song_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to unlike song '%s': %s", song_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to remove liked song.")

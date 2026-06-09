@@ -6,7 +6,8 @@ from fastapi import APIRouter, HTTPException, File, UploadFile
 
 from config import UPLOAD_DIR
 from database import get_db_ctx
-from models import PlaylistCreate, PlaylistResponse, SongAdd
+# NOTE: Assuming PlaylistUpdate is added to your models to support optional patch fields
+from models import PlaylistCreate, PlaylistResponse, SongAdd, PlaylistUpdate 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -78,6 +79,17 @@ def _delete_thumbnail(thumbnail_path: str | None) -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@router.get("/", response_model=list[PlaylistResponse])
+def get_all_playlists():
+    with get_db_ctx() as db:
+        rows = db.execute("""
+        SELECT p.*, COUNT(ps.song_id) as song_count
+        FROM playlists p
+        LEFT JOIN playlist_songs ps ON p.id = ps.playlist_id
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+        """).fetchall()
+        return [dict(row) for row in rows]
 
 @router.post("/", response_model=PlaylistResponse, status_code=201)
 def create_playlist(pl: PlaylistCreate):
@@ -100,16 +112,56 @@ def create_playlist(pl: PlaylistCreate):
     except HTTPException:
         raise
     except Exception as e:
-        # Clean up uploaded file if DB write fails
         logger.error("Failed to create playlist '%s': %s", pl.name, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create playlist.")
+
+
+@router.patch("/{playlist_id}", response_model=PlaylistResponse)
+def update_playlist(playlist_id: int, pl: PlaylistUpdate):
+    """Dynamically updates playlist text details (name, description, color)."""
+    logger.info("Updating playlist %d", playlist_id)
     
+    # Extract only fields that were explicitly provided
+    update_data = pl.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided for update.")
+
+    try:
+        with get_db_ctx() as db:
+            # Check playlist existence
+            if not db.execute("SELECT 1 FROM playlists WHERE id = ?", (playlist_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="Playlist not found")
+
+            # Dynamically build UPDATE query string
+            set_clause = ", ".join([f"{key} = ?" for key in update_data.keys()])
+            values = list(update_data.values()) + [playlist_id]
+
+            db.execute(f"UPDATE playlists SET {set_clause} WHERE id = ?", tuple(values))
+
+            # Fetch updated row and song count to return
+            updated_row = db.execute(
+                "SELECT * FROM playlists WHERE id = ?", (playlist_id,)
+            ).fetchone()
+            song_count = db.execute(
+                "SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = ?",
+                (playlist_id,)
+            ).fetchone()[0]
+
+        logger.info("Playlist %d updated successfully.", playlist_id)
+        return {**dict(updated_row), "song_count": song_count}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to update playlist %d: %s", playlist_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update playlist.")
+    
+
 @router.post("/{playlist_id}/thumbnail", response_model=PlaylistResponse)
 async def upload_thumbnail(
     playlist_id: int,
     thumbnail: UploadFile = File(...),
 ):
-    # Check playlist exists
     with get_db_ctx() as db:
         row = db.execute(
             "SELECT * FROM playlists WHERE id = ?", (playlist_id,)
@@ -135,28 +187,13 @@ async def upload_thumbnail(
                 (playlist_id,)
             ).fetchone()[0]
 
-        # Delete old thumbnail after successful DB update
         _delete_thumbnail(old_thumbnail)
-
         return {**dict(updated_row), "song_count": song_count}
 
     except Exception as e:
-        _delete_thumbnail(thumbnail_path)  # clean up new file if DB fails
+        _delete_thumbnail(thumbnail_path)  
         logger.error("Failed to upload thumbnail for playlist %s: %s", playlist_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to upload thumbnail.")
-
-@router.get("/", response_model=list[PlaylistResponse])
-def get_all_playlists():
-    with get_db_ctx() as db:
-        rows = db.execute("""
-            SELECT p.*, COUNT(ps.song_id) as song_count
-            FROM playlists p
-            LEFT JOIN playlist_songs ps ON p.id = ps.playlist_id
-            GROUP BY p.id
-            ORDER BY p.created_at DESC
-        """).fetchall()
-    return [dict(row) for row in rows]
-
 
 @router.get("/recently-played")
 def get_recently_played(limit: int = 5):
@@ -178,11 +215,9 @@ def get_recently_played(limit: int = 5):
 @router.get("/{playlist_id}/songs")
 def get_playlist_songs(playlist_id: int):
     with get_db_ctx() as db:
-        # Verify playlist exists
         if not db.execute("SELECT 1 FROM playlists WHERE id = ?", (playlist_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Playlist not found")
 
-        # BUG FIX: use column names not positional indices
         rows = db.execute("""
             SELECT song_id, song_title, position
             FROM playlist_songs
@@ -208,7 +243,6 @@ def add_song_to_playlist(playlist_id: int, song: SongAdd):
             ).fetchone():
                 raise HTTPException(status_code=409, detail="Song already in playlist")
 
-            # Upsert song into songs table
             db.execute(
                 """
                 INSERT INTO songs (song_id, title, artist, album, thumbnail, duration_sec, search_string, created_at)
@@ -254,6 +288,53 @@ def add_song_to_playlist(playlist_id: int, song: SongAdd):
         raise HTTPException(status_code=500, detail="Failed to add song to playlist.")
 
 
+@router.delete("/{playlist_id}/songs/{song_id}")
+def remove_song_from_playlist(playlist_id: int, song_id: str):
+    """Removes a song from a playlist and maintains consistent incremental tracking order positions."""
+    logger.info("Removing song '%s' from playlist %d", song_id, playlist_id)
+
+    try:
+        with get_db_ctx() as db:
+            if not db.execute("SELECT 1 FROM playlists WHERE id = ?", (playlist_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="Playlist not found")
+
+            # Check if song exists in the playlist and fetch its current position
+            target_song = db.execute(
+                "SELECT position FROM playlist_songs WHERE playlist_id = ? AND song_id = ?",
+                (playlist_id, song_id),
+            ).fetchone()
+
+            if not target_song:
+                raise HTTPException(status_code=404, detail="Song not found in this playlist")
+
+            removed_position = target_song["position"]
+
+            # Remove the song mapping
+            db.execute(
+                "DELETE FROM playlist_songs WHERE playlist_id = ? AND song_id = ?",
+                (playlist_id, song_id),
+            )
+
+            # Re-order track sequential indices to patch structural sequence gap
+            db.execute(
+                """
+                UPDATE playlist_songs 
+                SET position = position - 1 
+                WHERE playlist_id = ? AND position > ?
+                """,
+                (playlist_id, removed_position),
+            )
+
+        logger.info("Song '%s' successfully removed from playlist %d", song_id, playlist_id)
+        return {"message": "Song removed successfully from playlist"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to remove song '%s' from playlist %d: %s", song_id, playlist_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to remove song from playlist.")
+
+
 @router.post("/{playlist_id}/played")
 def mark_played(playlist_id: int):
     try:
@@ -292,7 +373,6 @@ async def delete_playlist(playlist_id: int):
             db.execute("DELETE FROM playlist_songs WHERE playlist_id = ?", (playlist_id,))
             db.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
 
-        # File deletion is outside the DB transaction — non-fatal
         _delete_thumbnail(thumbnail_path)
 
         logger.info("Playlist '%s' (id=%d) deleted", playlist_name, playlist_id)

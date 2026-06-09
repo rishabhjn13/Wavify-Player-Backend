@@ -4,7 +4,6 @@ from yt_dlp import YoutubeDL
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from database import get_db_ctx
-from models import SongAdd
 from config import YDL_MAX_RETRIES, STREAM_URL_TTL
 from utils.logger import get_logger
 
@@ -21,11 +20,16 @@ YDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "skip_download": True,
+    "cookiefile": "../cookies.txt",
     "extract_flat": False,
-    "cookiesfrombrowser": ("brave",),
     "youtube_include_dash_manifest": False,
 }
 
+YDL_SEARCH_OPTS = {
+    **YDL_OPTS,
+    "extract_flat": True,
+    "quiet": True,
+}
 
 @retry(
     retry=retry_if_exception_type((Exception,)),
@@ -40,6 +44,27 @@ def _extract_info(url: str) -> dict:
     """
     with YoutubeDL(YDL_OPTS) as ydl:
         return ydl.extract_info(url, download=False)
+
+@retry(
+    retry=retry_if_exception_type((Exception,)),
+    stop=stop_after_attempt(YDL_MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
+def _search_top_video_id(title: str) -> str | None:
+    """
+    Search YouTube by title and return the video ID of the top result.
+    Uses extract_flat=True so yt-dlp only fetches the search page — no per-video requests.
+    """
+    search_url = f"ytsearch1:{title}"
+    with YoutubeDL(YDL_SEARCH_OPTS) as ydl:
+        result = ydl.extract_info(search_url, download=False)
+
+    entries = (result or {}).get("entries", [])
+    if not entries:
+        return None
+
+    return entries[0].get("id")
 
 
 def _pick_stream_url(video: dict) -> str | None:
@@ -107,7 +132,7 @@ def _set_cache(song_id: str, video: dict, stream_url: str) -> None:
             """,
             (
                 song_id,
-                video.get("song_id"),
+                video.get("id"),
                 video.get("title"),
                 video.get("uploader"),
                 video.get("duration"),
@@ -189,38 +214,122 @@ def get_audio(song_id: str):
     }
 
 
-@router.post("/songs")
-def add_song(song: SongAdd):
-    logger.info("Adding song: '%s' by '%s'", song.title, song.artist)
+@router.get("/search-audio")
+def search_audio(title: str):
+    """
+    Search YouTube by song title and return a stream URL for the top result.
+
+    Flow:
+        1. Check cache keyed by normalised title.
+        2. Search YouTube via yt-dlp (ytsearch1) to get the best-match video ID.
+        3. Check cache again by resolved video ID (avoids a duplicate yt-dlp
+        extraction when the same video was already fetched via /get-audio).
+        4. Full extraction + stream-URL resolution via _extract_info (same path
+        as /get-audio, including retry logic).
+        5. Cache under both the title key and the video-ID key.
+    """
+    if not title or not title.strip():
+        raise HTTPException(status_code=400, detail="Missing title parameter.")
+
+    title = title.strip()
+    cache_key = title.lower()   # normalise so minor capitalisation differences hit cache
+    logger.info("Title search requested: '%s'", title)
+
+    # 1. Cache-first — keyed by normalised title
+    cached = _get_cached(cache_key)
+    if cached:
+        return {
+            "song_id": cached["song_id"],
+            "title": cached["title"],
+            "uploader": cached["uploader"],
+            "duration": cached["duration"],
+            "thumbnail": cached["thumbnail"],
+            "stream_url": cached["stream_url"],
+            "source": "cache",
+        }
+
+    # 2. Resolve title → video ID
     try:
-        with get_db_ctx() as db:
-            db.execute(
-                """
-                INSERT OR IGNORE INTO songs (song_id, title, artist, album, thumbnail, duration_sec, search_string)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (song.song_id, song.title, song.artist, song.album, song.album_art, song.duration_sec, song.search_string),
-            )
-        logger.info("Song added: '%s' (%s)", song.title, song.song_id)
-        return {"message": f"'{song.title}' added to songs", "song_id": song.song_id}
+        video_id = _search_top_video_id(title)
     except Exception as e:
-        logger.error("Failed to add song '%s': %s", song.song_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to save song.")
+        logger.error("yt-dlp title search failed for '%s' after %d retries: %s", title, YDL_MAX_RETRIES, e, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not search for the title. The source may be unavailable — please try again.",
+        )
+
+    if not video_id:
+        logger.warning("No search results for title: '%s'", title)
+        raise HTTPException(status_code=404, detail="No results found for this title.")
+
+    logger.info("Title '%s' resolved to video_id '%s'", title, video_id)
+
+    # 3. Secondary cache check — maybe this video_id is already cached from /get-audio
+    cached_by_id = _get_cached(video_id)
+    if cached_by_id:
+        # Also backfill the title key so next lookup is instant
+        try:
+            with get_db_ctx() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO video_cache
+                    (search_query, song_id, title, uploader, duration, thumbnail, stream_url, cached_at)
+                    SELECT ?, song_id, title, uploader, duration, thumbnail, stream_url, cached_at
+                    FROM video_cache WHERE search_query = ?
+                    """,
+                    (cache_key, video_id),
+                )
+        except Exception as e:
+            logger.warning("Failed to backfill title cache key '%s': %s", cache_key, e)
+
+        return {
+            "song_id": cached_by_id["song_id"],
+            "title": cached_by_id["title"],
+            "uploader": cached_by_id["uploader"],
+            "duration": cached_by_id["duration"],
+            "thumbnail": cached_by_id["thumbnail"],
+            "stream_url": cached_by_id["stream_url"],
+            "source": "cache",
+        }
+
+    # 4. Full extraction — identical to /get-audio from here on
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        video = _extract_info(youtube_url)
+    except Exception as e:
+        logger.error("yt-dlp extraction failed for video_id '%s' after %d retries: %s", video_id, YDL_MAX_RETRIES, e, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not fetch audio. The source may be unavailable — please try again.",
+        )
+
+    if not video:
+        logger.warning("Empty yt-dlp result for video_id '%s' (title search: '%s')", video_id, title)
+        raise HTTPException(status_code=404, detail="No results found for this title.")
+
+    logger.info("Resolved video: '%s' by '%s'", video.get("title"), video.get("uploader"))
+
+    stream_url = _pick_stream_url(video)
+    if not stream_url:
+        logger.error("Could not extract stream URL for video_id '%s'", video_id)
+        raise HTTPException(status_code=500, detail="Could not extract a playable stream URL.")
+
+    # 5. Cache under both title key and video-ID key
+    for key in (cache_key, video_id):
+        try:
+            _set_cache(key, video, stream_url)
+        except Exception as e:
+            logger.warning("Failed to cache result under key '%s': %s", key, e)
+
+    return {
+        "song_id": video.get("id"),
+        "title": video.get("title"),
+        "uploader": video.get("uploader"),
+        "duration": video.get("duration"),
+        "thumbnail": video.get("thumbnail"),
+        "stream_url": stream_url,
+        "source": "live",
+    }
 
 
-@router.get("/songs/last-played")
-def get_last_played():
-    with get_db_ctx() as db:
-        row = db.execute(
-            """
-            SELECT song_id, title, artist, album, thumbnail, duration_sec
-            FROM songs
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-        ).fetchone()
 
-    if not row:
-        return None
-
-    return dict(row)

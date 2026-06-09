@@ -14,6 +14,7 @@ from routes.search import router as search_router
 from routes.audio import router as audio_router
 from routes.download import router as download_router
 from routes.songs import router as songs_router
+from routes.liked_songs import router as liked_songs_router
 
 logger = get_logger(__name__)
 
@@ -132,7 +133,7 @@ app.include_router(search_router)
 app.include_router(audio_router)
 app.include_router(download_router)
 app.include_router(songs_router)
-
+app.include_router(liked_songs_router)
 # ---------------------------------------------------------------------------
 # Core endpoints
 # ---------------------------------------------------------------------------
